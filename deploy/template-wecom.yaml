@@ -1,0 +1,1659 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# Modified: Feishu → WeCom (企业微信) integration
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS TechBot - AI-powered AWS technical assistant on Amazon Bedrock AgentCore Runtime
+  with WeCom (企业微信) bot integration and optional Memory for multi-turn conversations.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Basic Configuration
+        Parameters:
+          - ProjectName
+          - ModelId
+      - Label:
+          default: Memory Configuration
+        Parameters:
+          - EnableMemory
+          - MemoryExpiryDays
+      - Label:
+          default: WeCom Integration (企业微信)
+        Parameters:
+          - WeComCorpId
+          - WeComSecret
+          - WeComAgentId
+          - WeComToken
+          - WeComEncodingAESKey
+    ParameterLabels:
+      ProjectName:
+        default: Project Name
+      ModelId:
+        default: Amazon Bedrock Model ID
+      EnableMemory:
+        default: Enable AgentCore Memory?
+      MemoryExpiryDays:
+        default: Memory Expiry (Days)
+      WeComCorpId:
+        default: WeCom Corp ID (企业ID)
+      WeComSecret:
+        default: WeCom App Secret (应用Secret)
+      WeComAgentId:
+        default: WeCom Agent ID (应用AgentId)
+      WeComToken:
+        default: WeCom Callback Token (回调Token)
+      WeComEncodingAESKey:
+        default: WeCom Encoding AES Key (回调EncodingAESKey)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: techbot
+    AllowedPattern: ^[a-z][a-z0-9]*$
+    ConstraintDescription: Lowercase alphanumeric only, starting with a letter
+    Description: Project name (lowercase), used as prefix for all resources
+
+  ModelId:
+    Type: String
+    Default: zai.glm-5
+    AllowedValues:
+      - zai.glm-5
+      - minimax.minimax-m2.5
+      - global.anthropic.claude-opus-4-6-v1
+    Description: >
+      Select an Amazon Bedrock model. 
+      GLM-5 (Zhipu AI) | MiniMax M2.5 (MiniMax) | Claude Opus 4.6 (Anthropic)
+
+  EnableMemory:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable AgentCore Memory for multi-turn conversation context.
+      If disabled, the agent will not remember previous messages.
+
+  MemoryExpiryDays:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 365
+    Description: >
+      Number of days before memory events expire (7-365).
+      Only effective when Memory is enabled.
+
+  WeComCorpId:
+    Type: String
+    MinLength: 1
+    Description: >
+      企业微信企业ID (corpid)。
+      在企业微信管理后台 → 我的企业 → 企业信息 中获取。
+
+  WeComSecret:
+    Type: String
+    MinLength: 1
+    NoEcho: true
+    Description: >
+      企业微信应用 Secret。
+      在企业微信管理后台 → 应用管理 → 自建应用 中获取。
+
+  WeComAgentId:
+    Type: String
+    MinLength: 1
+    Description: >
+      企业微信应用 AgentId。
+      在企业微信管理后台 → 应用管理 → 自建应用 中获取。
+
+  WeComToken:
+    Type: String
+    MinLength: 1
+    Description: >
+      企业微信回调配置中的 Token。
+      在应用 → 接收消息 → 设置API接收 中自行设置或随机生成。
+
+  WeComEncodingAESKey:
+    Type: String
+    MinLength: 43
+    MaxLength: 43
+    Description: >
+      企业微信回调配置中的 EncodingAESKey (43位字符)。
+      在应用 → 接收消息 → 设置API接收 中自行设置或随机生成。
+
+Mappings:
+  ArtifactBucket:
+    us-west-2:
+      Name: haomiaoj-yuzeli-aws-techbot-oregon
+
+Rules:
+  RegionCheck:
+    Assertions:
+      - Assert: !Contains
+          - - us-west-2
+          - !Ref AWS::Region
+        AssertDescription: This stack can only be deployed in us-west-2
+
+Conditions:
+  CreateMemory: !Equals [!Ref EnableMemory, 'true']
+
+Resources:
+
+
+  # =========================
+  # ECR Repository (private, auto-created)
+  # =========================
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-repo
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: false
+
+  # =========================
+  # CodeBuild: pull public image → push to private ECR
+  # =========================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt EcrRepo.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ImageCopyProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-image-copy
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-repo
+          - Name: SOURCE_IMAGE
+            Value: public.ecr.aws/f3p2c7j2/techbot:latest
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+                - docker pull $SOURCE_IMAGE
+                - docker tag $SOURCE_IMAGE $ECR_REPO:latest
+                - docker push $ECR_REPO:latest
+      TimeoutInMinutes: 10
+
+  # Custom Resource Lambda: triggers CodeBuild and waits
+  ImageCopyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-imagecopy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ImageCopyProject.Arn
+
+  ImageCopyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-image-copy
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 128
+      Role: !GetAtt ImageCopyFunctionRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ImageCopyProject
+      Code:
+        ZipFile: |
+          import json, os, time, boto3, urllib.request
+          cb = boto3.client("codebuild")
+          def send_response(event, context, status, data={}):
+              body = json.dumps({"Status": status, "Reason": f"See CloudWatch: {context.log_group_name}", "PhysicalResourceId": context.log_stream_name, "StackId": event["StackId"], "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"], "Data": data}).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, headers={"Content-Type": ""}, method="PUT")
+              urllib.request.urlopen(req)
+          def handler(event, context):
+              if event["RequestType"] == "Delete":
+                  send_response(event, context, "SUCCESS")
+                  return
+              try:
+                  build = cb.start_build(projectName=os.environ["PROJECT_NAME"])
+                  build_id = build["build"]["id"]
+                  while True:
+                      time.sleep(10)
+                      r = cb.batch_get_builds(ids=[build_id])
+                      status = r["builds"][0]["buildStatus"]
+                      if status == "SUCCEEDED":
+                          send_response(event, context, "SUCCESS")
+                          return
+                      elif status in ("FAILED", "FAULT", "TIMED_OUT", "STOPPED"):
+                          send_response(event, context, "FAILED", {"Error": status})
+                          return
+              except Exception as e:
+                  send_response(event, context, "FAILED", {"Error": str(e)})
+
+  ImageCopyTrigger:
+    Type: Custom::ImageCopy
+    DependsOn:
+      - EcrRepo
+      - ImageCopyProject
+    Properties:
+      ServiceToken: !GetAtt ImageCopyFunction.Arn
+
+  # =========================
+  # AgentCore Memory (conditional)
+  # =========================
+  AgentCoreMemoryRole:
+    Type: AWS::IAM::Role
+    Condition: CreateMemory
+    Properties:
+      RoleName: !Sub ${ProjectName}-memory-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+
+  AgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Condition: CreateMemory
+    Properties:
+      Name: !Sub ${ProjectName}_memory
+      Description: !Sub ${ProjectName} multi-turn conversation memory
+      EventExpiryDuration: !Ref MemoryExpiryDays
+      MemoryExecutionRoleArn: !GetAtt AgentCoreMemoryRole.Arn
+
+
+  # =========================
+  # DynamoDB: Message Deduplication (消息去重)
+  # =========================
+  DeduplicationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-msg-dedup
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: msg_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: msg_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+  # =========================
+  # Cognito (Gateway auth)
+  # =========================
+  GatewayCognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${ProjectName}-gateway-pool
+
+  GatewayCognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref GatewayCognitoUserPool
+      Identifier: gateway
+      Name: !Sub ${ProjectName}-gateway
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Invoke the gateway
+
+  GatewayCognitoClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GatewayCognitoResourceServer
+    Properties:
+      UserPoolId: !Ref GatewayCognitoUserPool
+      ClientName: !Sub ${ProjectName}-gateway-client
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - gateway/invoke
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+
+  GatewayCognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref GatewayCognitoUserPool
+      Domain: !Sub ${ProjectName}-gw-${AWS::AccountId}
+
+  # =========================
+  # AgentCore Gateway
+  # =========================
+  GatewayServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-gateway-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GatewayPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GlobalKnowledgeFunction.Arn
+                  - !GetAtt ChinaKnowledgeFunction.Arn
+                  - !GetAtt CustomerStoriesFunction.Arn
+                  - !GetAtt PricingFunction.Arn
+                  - !GetAtt KiroKnowledgeFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  AgentCoreGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub ${ProjectName}-gateway
+      ProtocolType: MCP
+      RoleArn: !GetAtt GatewayServiceRole.Arn
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub >-
+            https://cognito-idp.${AWS::Region}.amazonaws.com/${GatewayCognitoUserPool}/.well-known/openid-configuration
+          AllowedClients:
+            - !Ref GatewayCognitoClient
+
+  # =========================
+  # Gateway Target: Global Knowledge
+  # =========================
+  GlobalKnowledgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-global-knowledge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  GlobalKnowledgeLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-global-knowledge-deps
+      Description: Dependencies for global-knowledge gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: global-knowledge-layer.zip
+
+  GlobalKnowledgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-global-knowledge
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: global-knowledge-code.zip
+      Role: !GetAtt GlobalKnowledgeFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref GlobalKnowledgeLayer
+
+  GlobalKnowledgeTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotGlobalKnowledge
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt GlobalKnowledgeFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: aws___search_documentation
+                  Description: >-
+                    Search across all AWS documentation, blogs, best practices, and agent SOPs.
+                    Use specific AWS service names for best results.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search_phrase:
+                        Type: string
+                        Description: The search query
+                      topics:
+                        Type: array
+                        Description: >-
+                          Optional list of topics to filter (up to 3): reference_documentation,
+                          current_awareness, troubleshooting, amplify_docs, cdk_docs,
+                          cdk_constructs, cloudformation, agent_sops, general
+                    Required:
+                      - search_phrase
+                - Name: aws___read_documentation
+                  Description: >-
+                    Fetch and convert an AWS documentation page to markdown.
+                    For long docs, use start_index for pagination.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the AWS documentation page
+                      start_index:
+                        Type: integer
+                        Description: Character index to start from (for pagination)
+                      max_length:
+                        Type: integer
+                        Description: Maximum characters to return
+                    Required:
+                      - url
+                - Name: aws___recommend
+                  Description: >-
+                    Get content recommendations for an AWS documentation page.
+                    Returns related pages and newly released content.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the documentation page
+                    Required:
+                      - url
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: China Knowledge
+  # =========================
+  ChinaKnowledgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-china-knowledge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ChinaKnowledgeLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-china-knowledge-deps
+      Description: Dependencies for china-knowledge gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: china-knowledge-layer.zip
+
+  ChinaKnowledgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-china-knowledge
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: china-knowledge-code.zip
+      Role: !GetAtt ChinaKnowledgeFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref ChinaKnowledgeLayer
+
+  ChinaKnowledgeTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotChinaKnowledge
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ChinaKnowledgeFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: get_China_available_services
+                  Description: >-
+                    Search for AWS services available in China regions (cn-north-1 Beijing, cn-northwest-1 Ningxia).
+                    Use to check if a specific AWS service is available in China.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search_phrase:
+                        Type: string
+                        Description: Service name or keyword (e.g. Amazon Bedrock, Lambda, S3)
+                      limit:
+                        Type: integer
+                        Description: Maximum number of results (default 5)
+                    Required:
+                      - search_phrase
+                - Name: read_China_documentation
+                  Description: >-
+                    Fetch and read an AWS China documentation page.
+                    Supports amazonaws.cn and aws.amazon.com URLs.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the documentation page (amazonaws.cn or aws.amazon.com domain)
+                      max_length:
+                        Type: integer
+                        Description: Maximum characters to return (default 5000)
+                      start_index:
+                        Type: integer
+                        Description: Character offset for pagination (default 0)
+                    Required:
+                      - url
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: Customer Stories
+  # =========================
+  CustomerStoriesFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-customer-stories-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  CustomerStoriesLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-customer-stories-deps
+      Description: Dependencies for customer-stories gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: customer-stories-layer.zip
+
+  CustomerStoriesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-customer-stories
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: customer-stories-code.zip
+      Role: !GetAtt CustomerStoriesFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref CustomerStoriesLayer
+
+  CustomerStoriesTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotCustomerStory
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt CustomerStoriesFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: search_stories
+                  Description: >-
+                    Search AWS customer success stories by keyword. Search by company name,
+                    AWS service, industry, or use case. Returns customer name, headline,
+                    summary, tags, and URL. The search API only supports English.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search_phrase:
+                        Type: string
+                        Description: Search keyword in English
+                      limit:
+                        Type: integer
+                        Description: Results per page (default 8, max 50)
+                      page:
+                        Type: integer
+                        Description: Page number, 0-based (default 0)
+                    Required:
+                      - search_phrase
+                - Name: read_story
+                  Description: >-
+                    Read the full content of an AWS customer story page.
+                    Use URLs from search_stories results. Does NOT support YouTube URLs.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the AWS customer story (aws.amazon.com domain)
+                      max_length:
+                        Type: integer
+                        Description: Maximum characters to return (default 10000)
+                      start_index:
+                        Type: integer
+                        Description: Character offset for pagination (default 0)
+                    Required:
+                      - url
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: Pricing
+  # =========================
+  PricingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-pricing-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSPriceListServiceFullAccess
+
+  PricingLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-pricing-deps
+      Description: Dependencies for pricing gateway target (includes aws-pricing-mcp-server)
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: pricing-layer.zip
+
+  PricingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-pricing
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: pricing-code.zip
+      Role: !GetAtt PricingFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Layers:
+        - !Ref PricingLayer
+
+  PricingTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotPricing
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt PricingFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: get_pricing_service_codes
+                  Description: >-
+                    Get available AWS service codes for pricing queries.
+                    Always call this first before get_pricing.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search:
+                        Type: string
+                        Description: Optional search filter for service codes
+                - Name: get_pricing_service_attributes
+                  Description: >-
+                    Get available filter attributes for a given AWS service.
+                    Call after get_pricing_service_codes to discover filterable dimensions.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code (e.g. AmazonEC2)
+                    Required:
+                      - service_code
+                - Name: get_pricing_attribute_values
+                  Description: >-
+                    Get valid values for a specific pricing attribute.
+                    Call after get_pricing_service_attributes.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code
+                      attribute_name:
+                        Type: string
+                        Description: Attribute name from get_pricing_service_attributes
+                    Required:
+                      - service_code
+                      - attribute_name
+                - Name: get_pricing
+                  Description: >-
+                    Get actual AWS pricing using validated parameters from previous steps.
+                    WARNING - Always call get_pricing_service_codes, get_pricing_service_attributes,
+                    and get_pricing_attribute_values first.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code
+                      filters:
+                        Type: array
+                        Description: Array of filter objects with Field, Value, Type
+                    Required:
+                      - service_code
+                - Name: get_price_list_urls
+                  Description: >-
+                    Get URLs to download complete pricing datasets (CSV/JSON).
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code
+                      region:
+                        Type: string
+                        Description: AWS region code
+                    Required:
+                      - service_code
+                - Name: generate_cost_report
+                  Description: >-
+                    Generate a detailed cost report. Only use when user explicitly requests it.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      services:
+                        Type: array
+                        Description: Array of service configurations for cost calculation
+                    Required:
+                      - services
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: Kiro Knowledge
+  # =========================
+  KiroKnowledgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-kiro-knowledge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  KiroKnowledgeLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-kiro-knowledge-deps
+      Description: Dependencies for kiro-knowledge gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: kiro-knowledge-layer.zip
+
+  KiroKnowledgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-kiro-knowledge
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: kiro-knowledge-code.zip
+      Role: !GetAtt KiroKnowledgeFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Layers:
+        - !Ref KiroKnowledgeLayer
+
+  KiroKnowledgeTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotKiroKnowledge
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt KiroKnowledgeFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: kiro_search
+                  Description: >-
+                    Search Kiro documentation across both kiro.dev (official English docs) and
+                    Book of Kiro (community Chinese docs) in parallel.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      keyword_en:
+                        Type: string
+                        Description: English keyword to search kiro.dev official documentation
+                      keyword_zh:
+                        Type: string
+                        Description: Keyword to search Book of Kiro community documentation
+                      original_query:
+                        Type: string
+                        Description: Original query of the user
+                      limit:
+                        Type: integer
+                        Description: Maximum number of results to return per source (default 10)
+                    Required:
+                      - keyword_en
+                      - keyword_zh
+                      - original_query
+                - Name: kiro_read
+                  Description: >-
+                    Fetch and read the content of a Kiro documentation page.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the Kiro documentation page to read
+                      original_query:
+                        Type: string
+                        Description: Original query of the user
+                      start_index:
+                        Type: integer
+                        Description: Character offset to start reading from (default 0)
+                      max_length:
+                        Type: integer
+                        Description: Maximum number of characters to return (default 5000)
+                    Required:
+                      - url
+                      - original_query
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # AgentCore Runtime
+  # =========================
+  AgentCoreRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-runtime-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSPriceListServiceFullAccess
+      Policies:
+        - PolicyName: RuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt GatewayCognitoUserPool.Arn
+
+  AgentCoreRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn: ImageCopyTrigger
+    Properties:
+      AgentRuntimeName: !Sub ${ProjectName}_runtime
+      Description: !Sub ${ProjectName} AgentCore Runtime
+      RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-repo:latest
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      EnvironmentVariables:
+        AWS_REGION: !Ref AWS::Region
+        MODEL_ID: !Ref ModelId
+        MEMORY_ID: !If
+          - CreateMemory
+          - !GetAtt AgentCoreMemory.MemoryId
+          - ''
+        GATEWAY_URL: !Sub
+          - https://${GatewayId}.gateway.bedrock-agentcore.${AWS::Region}.amazonaws.com/mcp
+          - GatewayId: !GetAtt AgentCoreGateway.GatewayIdentifier
+        COGNITO_USER_POOL_ID: !Ref GatewayCognitoUserPool
+        COGNITO_CLIENT_ID: !Ref GatewayCognitoClient
+
+  # =========================
+  # Secrets Manager (WeCom credentials)
+  # =========================
+  WeComCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}-wecom-credentials
+      Description: WeCom bot credentials (CorpId, Secret, AgentId, Token, EncodingAESKey)
+      SecretString: !Sub |
+        {
+          "CORP_ID": "${WeComCorpId}",
+          "SECRET": "${WeComSecret}",
+          "AGENT_ID": "${WeComAgentId}",
+          "TOKEN": "${WeComToken}",
+          "ENCODING_AES_KEY": "${WeComEncodingAESKey}"
+        }
+
+  # =========================
+  # API Gateway (WeCom webhook)
+  # =========================
+  TechBotApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-api
+      Description: !Sub ${ProjectName} WeCom webhook endpoint
+
+  ChatResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TechBotApi
+      ParentId: !GetAtt TechBotApi.RootResourceId
+      PathPart: chat
+
+  # GET method for WeCom URL verification (验证URL有效性)
+  ChatGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TechBotApi
+      ResourceId: !Ref ChatResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HandlerFunction.Arn}/invocations
+
+  # POST method for WeCom message callback (接收消息)
+  ChatPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TechBotApi
+      ResourceId: !Ref ChatResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HandlerFunction.Arn}/invocations
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ChatGetMethod
+      - ChatPostMethod
+    Properties:
+      RestApiId: !Ref TechBotApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TechBotApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  # =========================
+  # Handler Lambda (WeCom webhook receiver - 处理URL验证和消息接收)
+  # =========================
+  HandlerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-handler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeWorker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt WorkerFunction.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WeComCredentials
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt DeduplicationTable.Arn
+
+  HandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-handler
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json, os, hashlib, time, boto3
+          import xml.etree.ElementTree as ET
+          lambda_client = boto3.client("lambda")
+          sm_client = boto3.client("secretsmanager")
+          ddb = boto3.resource("dynamodb")
+          WORKER_FN = os.environ.get("WORKER_FUNCTION_NAME", "")
+          SECRET_ARN = os.environ.get("SECRET_ARN", "")
+          DEDUP_TABLE = os.environ.get("DEDUP_TABLE_NAME", "")
+          _secret = None
+          def get_secret():
+              global _secret
+              if not _secret:
+                  r = sm_client.get_secret_value(SecretId=SECRET_ARN)
+                  _secret = json.loads(r["SecretString"])
+              return _secret
+          def verify_sig(token, ts, nonce, data):
+              s = "".join(sorted([token, ts, nonce, data]))
+              return hashlib.sha1(s.encode()).hexdigest()
+          def lambda_handler(event, context):
+              sec = get_secret()
+              token = sec["TOKEN"]
+              method = event.get("httpMethod", "GET")
+              params = event.get("queryStringParameters") or {}
+              sig = params.get("msg_signature", "")
+              ts = params.get("timestamp", "")
+              nonce = params.get("nonce", "")
+              if method == "GET":
+                  echostr = params.get("echostr", "")
+                  if verify_sig(token, ts, nonce, echostr) != sig:
+                      return {"statusCode": 403, "body": "bad sig"}
+                  # Pass to worker for decrypt and return
+                  # For URL verification, we need sync response
+                  # So we decrypt here using openssl subprocess
+                  import subprocess, base64, struct
+                  aes_key = base64.b64decode(sec["ENCODING_AES_KEY"] + "=")
+                  iv = aes_key[:16]
+                  enc_bytes = base64.b64decode(echostr)
+                  proc = subprocess.run(
+                      ["openssl", "enc", "-aes-256-cbc", "-d", "-nopad",
+                       "-K", aes_key.hex(), "-iv", iv.hex()],
+                      input=enc_bytes, capture_output=True)
+                  if proc.returncode != 0:
+                      return {"statusCode": 500, "body": "decrypt fail"}
+                  dec = proc.stdout
+                  pad = dec[-1]
+                  dec = dec[:-pad]
+                  msg_len = struct.unpack(">I", dec[16:20])[0]
+                  echo_plain = dec[20:20+msg_len].decode("utf-8")
+                  return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": echo_plain}
+              # POST: message callback
+              body = event.get("body", "")
+              try:
+                  xml = ET.fromstring(body)
+                  encrypt_data = xml.find("Encrypt").text
+              except:
+                  return {"statusCode": 400, "body": "bad xml"}
+              if verify_sig(token, ts, nonce, encrypt_data) != sig:
+                  return {"statusCode": 403, "body": "bad sig"}
+              # Dedup check
+              msg_id = ""
+              try:
+                  import subprocess, base64, struct
+                  aes_key = base64.b64decode(sec["ENCODING_AES_KEY"] + "=")
+                  iv = aes_key[:16]
+                  enc_bytes = base64.b64decode(encrypt_data)
+                  proc = subprocess.run(
+                      ["openssl", "enc", "-aes-256-cbc", "-d", "-nopad",
+                       "-K", aes_key.hex(), "-iv", iv.hex()],
+                      input=enc_bytes, capture_output=True)
+                  dec = proc.stdout
+                  pad = dec[-1]
+                  dec = dec[:-pad]
+                  msg_len = struct.unpack(">I", dec[16:20])[0]
+                  msg_xml = dec[20:20+msg_len].decode("utf-8")
+                  msg_tree = ET.fromstring(msg_xml)
+                  msg_type = msg_tree.find("MsgType").text
+                  if msg_type != "text":
+                      return {"statusCode": 200, "body": "ok"}
+                  content = msg_tree.find("Content").text or ""
+                  from_user = msg_tree.find("FromUserName").text or ""
+                  mid = msg_tree.find("MsgId")
+                  msg_id = mid.text if mid is not None else ""
+                  chat_node = msg_tree.find("ChatId")
+                  is_group = chat_node is not None
+                  chat_id = chat_node.text if is_group else ""
+                  if is_group:
+                      import re
+                      content = re.sub(r"@[\w\u4e00-\u9fff]+\s*", "", content).strip()
+                  if not content.strip():
+                      return {"statusCode": 200, "body": "ok"}
+              except Exception as e:
+                  return {"statusCode": 200, "body": str(e)}
+              # Dedup
+              if msg_id and DEDUP_TABLE:
+                  tbl = ddb.Table(DEDUP_TABLE)
+                  try:
+                      tbl.put_item(
+                          Item={"msg_id": msg_id, "ttl": int(time.time())+300},
+                          ConditionExpression="attribute_not_exists(msg_id)")
+                  except:
+                      return {"statusCode": 200, "body": "dup"}
+              # Invoke worker async
+              lambda_client.invoke(
+                  FunctionName=WORKER_FN, InvocationType="Event",
+                  Payload=json.dumps({"from_user": from_user, "content": content,
+                      "is_group_chat": is_group, "chat_id": chat_id}).encode())
+              return {"statusCode": 200, "body": "ok"}
+      Role: !GetAtt HandlerFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref WorkerFunction
+          SECRET_ARN: !Ref WeComCredentials
+          DEDUP_TABLE_NAME: !Ref DeduplicationTable
+
+  HandlerApiPermissionGet:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TechBotApi}/*/GET/chat
+
+  HandlerApiPermissionPost:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TechBotApi}/*/POST/chat
+
+  # =========================
+  # Worker Lambda (calls AgentCore, sends WeCom message)
+  # =========================
+  WorkerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-worker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeAgentCore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !GetAtt AgentCoreRuntime.AgentRuntimeArn
+                  - !Sub ${AgentCoreRuntime.AgentRuntimeArn}/runtime-endpoint/*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WeComCredentials
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-worker
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          """
+          WeCom Worker Lambda
+          
+          Receives message from Handler, calls AgentCore Runtime for AI response,
+          then sends the reply back to the user via WeCom API.
+          """
+          import json, os, time, boto3, urllib.request, urllib.parse
+
+          sm_client = boto3.client("secretsmanager")
+          # AgentCore client created inside invoke_agent function
+
+          SECRET_ARN = os.environ.get("SECRET_ARN", "")
+          AGENT_RUNTIME_ARN = os.environ.get("AGENT_RUNTIME_ARN", "")
+          AGENTCORE_REGION = os.environ.get("AGENTCORE_REGION", "us-west-2")
+
+          _cached_secret = None
+          _access_token = None
+          _token_expires = 0
+
+          def get_secret():
+              global _cached_secret
+              if not _cached_secret:
+                  resp = sm_client.get_secret_value(SecretId=SECRET_ARN)
+                  _cached_secret = json.loads(resp["SecretString"])
+              return _cached_secret
+
+          def get_access_token():
+              """Get WeCom access_token (cached until expiry)"""
+              global _access_token, _token_expires
+              if _access_token and time.time() < _token_expires:
+                  return _access_token
+              secret = get_secret()
+              corp_id = secret["CORP_ID"]
+              corp_secret = secret["SECRET"]
+              url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={corp_id}&corpsecret={corp_secret}"
+              req = urllib.request.Request(url)
+              with urllib.request.urlopen(req) as response:
+                  data = json.loads(response.read().decode("utf-8"))
+              if data.get("errcode") == 0:
+                  _access_token = data["access_token"]
+                  _token_expires = time.time() + data.get("expires_in", 7200) - 300
+                  return _access_token
+              else:
+                  raise Exception(f"Failed to get access_token: {data}")
+
+          def send_wecom_message(to_user, content, use_markdown=True):
+              """Send WeCom message with Markdown support
+              
+              WeCom Markdown supported syntax:
+              - Headings: # / ## / ### / #### / ##### / ######
+              - Bold: **text**
+              - Links: [text](url)
+              - Inline code: `code`
+              - Blockquote: > text
+              - Font color: <font color="info">green</font>
+                         <font color="comment">gray</font>
+                         <font color="warning">orange-red</font>
+              
+              Note: WeCom Markdown does NOT support tables, images, or code blocks
+              """
+              secret = get_secret()
+              agent_id = secret["AGENT_ID"]
+              access_token = get_access_token()
+              url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}"
+              
+              # Convert to WeCom-compatible Markdown
+              if use_markdown:
+                  formatted = convert_to_wecom_markdown(content)
+              else:
+                  formatted = content
+              
+              # Markdown max 4096 bytes, smart split for long messages
+              parts = split_markdown_content(formatted, 3800)
+              
+              for i, part in enumerate(parts):
+                  if len(parts) > 1:
+                      part = f"**({i+1}/{len(parts)})**\n\n{part}"
+                  
+                  if use_markdown:
+                      payload = {
+                          "touser": to_user,
+                          "msgtype": "markdown",
+                          "agentid": int(agent_id),
+                          "markdown": {"content": part}
+                      }
+                  else:
+                      payload = {
+                          "touser": to_user,
+                          "msgtype": "text",
+                          "agentid": int(agent_id),
+                          "text": {"content": part}
+                      }
+                  
+                  data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                  req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+                  with urllib.request.urlopen(req) as response:
+                      resp_data = json.loads(response.read().decode("utf-8"))
+                  if resp_data.get("errcode") != 0:
+                      print(f"Send message error: {resp_data}")
+                      # Fallback to plain text if Markdown fails
+                      if use_markdown:
+                          send_wecom_message(to_user, content, use_markdown=False)
+                          return
+
+          def convert_to_wecom_markdown(text):
+              """Convert standard Markdown to WeCom-compatible format"""
+              import re
+              
+              # 1. Code blocks ``` -> blockquote + inline code
+              def replace_code_block(match):
+                  lang = match.group(1) or ""
+                  code = match.group(2).strip()
+                  lines = code.split("\n")
+                  result = ""
+                  if lang:
+                      result = f"> <font color=\"comment\">[{lang}]</font>\n"
+                  for line in lines:
+                      result += f"> `{line}`\n"
+                  return result
+              text = re.sub(r'```(\w*)\n(.*?)```', replace_code_block, text, flags=re.DOTALL)
+              
+              # 2. Unordered list - / * -> bullet symbol
+              text = re.sub(r'^[\-\*]\s+', '* ', text, flags=re.MULTILINE)
+              
+              # 3. Images ![alt](url) -> text link
+              text = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', r'[[img] \1](\2)', text)
+              
+              # 4. Tables -> key-value pair format
+              def replace_table(match):
+                  table_text = match.group(0)
+                  lines = [l.strip() for l in table_text.strip().split("\n") if l.strip()]
+                  if len(lines) < 3:
+                      return table_text
+                  headers = [c.strip() for c in lines[0].split("|") if c.strip()]
+                  result = ""
+                  for line in lines[2:]:
+                      cols = [c.strip() for c in line.split("|") if c.strip()]
+                      pairs = []
+                      for j, col in enumerate(cols):
+                          if j < len(headers):
+                              pairs.append(f"**{headers[j]}**: {col}")
+                      result += " | ".join(pairs) + "\n"
+                  return result
+              text = re.sub(r'(\|[^\n]+\|\n\|[\-:| ]+\|\n(\|[^\n]+\|\n?)+)', replace_table, text)
+              
+              # 5. Highlight keywords (warning) in orange
+              text = re.sub(r'\*\*(Warning|Alert|Warning|IMPORTANT|Important)\*\*',
+                          r'<font color="warning">**\1**</font>', text)
+              
+              # 6. Success/done keywords in green
+              text = re.sub(r'\*\*(Success|Done|Done|Success|Done)\*\*',
+                          r'<font color="info">**\1**</font>', text)
+              
+              return text
+
+          def split_markdown_content(content, max_bytes):
+              """Smart split at paragraph boundaries to preserve Markdown"""
+              if len(content.encode("utf-8")) <= max_bytes:
+                  return [content]
+              
+              parts = []
+              paragraphs = content.split("\n\n")
+              current_part = ""
+              
+              for para in paragraphs:
+                  test = current_part + ("\n\n" if current_part else "") + para
+                  if len(test.encode("utf-8")) > max_bytes:
+                      if current_part:
+                          parts.append(current_part)
+                      current_part = para
+                  else:
+                      current_part = test
+              
+              if current_part:
+                  parts.append(current_part)
+              
+              return parts if parts else [content]
+
+          def invoke_agent(user_id, user_message, chat_id=""):
+              """Invoke AgentCore Runtime for AI response"""
+              try:
+                  client = boto3.client("bedrock-agentcore", region_name=AGENTCORE_REGION)
+                  payload = {
+                      "actor_id": user_id,
+                      "session_id": f"{chat_id}_{user_id}" if chat_id else user_id,
+                      "channel_id": chat_id or user_id,
+                      "prompt": user_message,
+                      "encoded_images": []
+                  }
+                  response = client.invoke_agent_runtime(
+                      agentRuntimeArn=AGENT_RUNTIME_ARN,
+                      payload=json.dumps(payload, ensure_ascii=False),
+                  )
+                  response_body = response["response"].read()
+                  if isinstance(response_body, (bytes, bytearray)):
+                      response_body = response_body.decode("utf-8", errors="replace")
+                  response_data = json.loads(response_body)
+                  return response_data.get("response", "Sorry, I cannot answer this question at the moment.")
+              except Exception as e:
+                  print(f"AgentCore invocation error: {str(e)}")
+                  return f"AI service error: {str(e)}"
+
+          def send_wecom_group_message(chat_id, content, use_markdown=True):
+              """Send message to WeCom group chat via appchat API"""
+              secret=[REDACTED_PASSWORD]
+              access_token = get_access_token()
+              url = f"https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token={access_token}"
+              
+              # Convert to WeCom-compatible Markdown
+              if use_markdown:
+                  formatted = convert_to_wecom_markdown(content)
+              else:
+                  formatted = content
+              
+              # Smart split
+              parts = split_markdown_content(formatted, 3800)
+              
+              for i, part in enumerate(parts):
+                  if len(parts) > 1:
+                      part = f"**({i+1}/{len(parts)})**\n\n{part}"
+                  
+                  if use_markdown:
+                      payload = {
+                          "chatid": chat_id,
+                          "msgtype": "markdown",
+                          "markdown": {"content": part}
+                      }
+                  else:
+                      payload = {
+                          "chatid": chat_id,
+                          "msgtype": "text",
+                          "text": {"content": part}
+                      }
+                  
+                  data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                  req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+                  with urllib.request.urlopen(req) as response:
+                      resp_data = json.loads(response.read().decode("utf-8"))
+                  if resp_data.get("errcode") != 0:
+                      print(f"Send group message error: {resp_data}")
+                      if use_markdown:
+                          send_wecom_group_message(chat_id, content, use_markdown=False)
+                          return
+
+          def lambda_handler(event, context):
+              from_user = event.get("from_user", "")
+              content = event.get("content", "")
+              is_group_chat = event.get("is_group_chat", False)
+              chat_id = event.get("chat_id", "")
+              
+              if not from_user or not content:
+                  return {"statusCode": 200, "body": "no content"}
+              
+              # Use user_id as session_id, prefix with chat_id for group context isolation
+              session_id = f"{chat_id}_{from_user}" if is_group_chat else from_user
+              
+              # Call AgentCore
+              reply = invoke_agent(from_user, content, chat_id=chat_id if is_group_chat else "")
+              
+              # Send reply
+              if is_group_chat and chat_id:
+                  # Group chat: reply to group
+                  send_wecom_group_message(chat_id, reply)
+              else:
+                  # Private chat: reply to user
+                  send_wecom_message(from_user, reply)
+              
+              return {"statusCode": 200, "body": "ok"}
+      Role: !GetAtt WorkerFunctionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p312-requests:19
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref WeComCredentials
+          AGENT_RUNTIME_ARN: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+          AGENTCORE_REGION: !Ref AWS::Region
+
+Outputs:
+  MemoryId:
+    Condition: CreateMemory
+    Description: AgentCore Memory ID
+    Value: !GetAtt AgentCoreMemory.MemoryId
+
+  RuntimeArn:
+    Description: AgentCore Runtime ARN
+    Value: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+
+  GatewayId:
+    Description: AgentCore Gateway ID
+    Value: !GetAtt AgentCoreGateway.GatewayIdentifier
+
+  GatewayUrl:
+    Description: AgentCore Gateway MCP endpoint URL
+    Value: !Sub
+      - https://${GatewayId}.gateway.bedrock-agentcore.${AWS::Region}.amazonaws.com/mcp
+      - GatewayId: !GetAtt AgentCoreGateway.GatewayIdentifier
+
+  WeComCallbackUrl:
+    Description: >
+      企业微信回调URL - 粘贴到企业微信管理后台 → 应用管理 → 自建应用 → 接收消息 → 设置API接收 → URL
+    Value: !Sub https://${TechBotApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chat
+
+  HandlerFunctionName:
+    Value: !Ref HandlerFunction
+
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
